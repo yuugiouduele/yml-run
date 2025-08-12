@@ -1,0 +1,668 @@
+# k8s-ml-100apps-starter
+# 100個規模で機械学習アプリ（API）を量産・自動デプロイするスターター
+# ── FastAPI + scikit-learn + Helm + GitHub Actions + MkDocs
+#
+# 使い方（超短縮）
+# 1) このリポジトリをテンプレとして使う（Use this template）。
+# 2) GitHub Secrets 設定：DOCKERHUB_USERNAME, DOCKERHUB_TOKEN, KUBE_CONFIG_B64, PAGES_TOKEN（必要なら）
+# 3) apps/sample_app をコピーして新アプリを作成、apps/apps.yaml に追記
+# 4) pushすると CI → 画像ビルド → k8sへ Helm upgrade → MkDocsでドキュメント自動公開
+#
+# ------------------------------------------------------------
+# FILE: README.md
+# ------------------------------------------------------------
+# k8s-ml-100apps-starter
+
+100個規模でMLアプリ（FastAPI推論サーバ）を量産し、GitHub Actionsで自動ビルド＆k8sにデプロイ、MkDocsでGitHub Pagesに自動ドキュメント公開するためのスターターです。
+
+## 構成
+- **apps/**: 各アプリ（テンプレ含む）
+- **charts/**: Helmチャート（共通）
+- **.github/workflows/**: CI/CD（テスト・ビルド・デプロイ・Docs）
+- **scripts/**: 自動生成やローカル検証用スクリプト
+- **docs/** + **mkdocs.yml**: プロジェクトサイト（自動更新）
+
+## 主要コマンド
+```bash
+make dev        # ローカル起動（uvicorn）
+make test       # pytest
+make build      # Docker build
+make kind       # kindでローカルk8s作成（任意）
+make deploy     # ローカルk8sへhelmデプロイ（KUBECONFIG必要）
+```
+
+## GitHub Secrets（必須）
+- `DOCKERHUB_USERNAME`, `DOCKERHUB_TOKEN` : Docker Hub用
+- `KUBE_CONFIG_B64` : kubeconfigのBase64（`cat ~/.kube/config | base64 -w0`）
+- `PAGES_TOKEN` : GitHub Pages（Pages使わないなら不要）
+
+## 量産手順
+1. `apps/sample_app` をコピーして `apps/your_app` を作り、`apps/apps.yaml` に登録
+2. `model.py` / `features.py` / `evaluation.py` を改変
+3. `README_app.md` に使い方（curlの例）を最低限記述
+4. push → 自動でDocker build & push → Helm upgrade → Docs更新
+
+---
+
+# ------------------------------------------------------------
+# FILE: apps/apps.yaml
+# ------------------------------------------------------------
+# デプロイ対象アプリの定義（追加するだけで自動でCIマトリクスに乗る）
+apps:
+  - name: sample-app
+    path: apps/sample_app
+    image: your-dockerhub-username/sample-app
+    replicas: 1
+    cpu: "100m"
+    memory: "256Mi"
+    ingressHost: sample.your-domain.local
+
+# 例: 新規アプリを追加
+#  - name: text-ranker
+#    path: apps/text_ranker
+#    image: your-dockerhub-username/text-ranker
+#    replicas: 2
+#    cpu: "200m"
+#    memory: "512Mi"
+#    ingressHost: text-ranker.your-domain.local
+
+---
+
+# ------------------------------------------------------------
+# FILE: apps/sample_app/app/model.py
+# ------------------------------------------------------------
+from __future__ import annotations
+from dataclasses import dataclass
+import numpy as np
+from sklearn.linear_model import LogisticRegression
+
+@dataclass
+class SimpleClassifier:
+    model: LogisticRegression
+
+    @classmethod
+    def train(cls, X: np.ndarray, y: np.ndarray) -> "SimpleClassifier":
+        clf = LogisticRegression(max_iter=200)
+        clf.fit(X, y)
+        return cls(model=clf)
+
+    def predict_proba(self, X: np.ndarray) -> np.ndarray:
+        return self.model.predict_proba(X)[:, 1]
+
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        return (self.predict_proba(X) > 0.5).astype(int)
+
+# デモ用の学習（実運用ではオフライン学習→モデル登録に置換可）
+def get_demo_model() -> SimpleClassifier:
+    rng = np.random.RandomState(42)
+    X = rng.randn(200, 3)
+    w = np.array([1.5, -0.5, 0.8])
+    logits = X @ w + rng.randn(200) * 0.5
+    y = (logits > 0).astype(int)
+    return SimpleClassifier.train(X, y)
+
+MODEL = get_demo_model()
+
+---
+
+# ------------------------------------------------------------
+# FILE: apps/sample_app/app/features.py
+# ------------------------------------------------------------
+import numpy as np
+from typing import List
+
+# シンプルな特徴抽出テンプレ（用途別に差し替え）
+# NLP: ここにTF-IDFや埋め込み抽出を配置しても良い（依存はrequirementsに）
+
+def extract_features(v: List[float]) -> np.ndarray:
+    arr = np.array(v, dtype=float)
+    # 例: 正規化 + 多項特徴
+    mean = arr.mean() if arr.size else 0.0
+    std = arr.std() + 1e-8
+    z = (arr - mean) / std
+    poly = np.concatenate([arr, arr**2, z])
+    return poly.reshape(1, -1)
+
+---
+
+# ------------------------------------------------------------
+# FILE: apps/sample_app/app/evaluation.py
+# ------------------------------------------------------------
+from typing import Dict
+import numpy as np
+from sklearn.metrics import roc_auc_score, f1_score, precision_score, recall_score
+
+# 共通評価ルーチン（再利用可）
+
+def evaluate(y_true: np.ndarray, y_prob: np.ndarray) -> Dict[str, float]:
+    y_pred = (y_prob > 0.5).astype(int)
+    metrics = {
+        "AUC": float(roc_auc_score(y_true, y_prob)) if len(np.unique(y_true)) > 1 else float("nan"),
+        "F1": float(f1_score(y_true, y_pred, zero_division=0)),
+        "Precision": float(precision_score(y_true, y_pred, zero_division=0)),
+        "Recall": float(recall_score(y_true, y_pred, zero_division=0)),
+    }
+    return metrics
+
+---
+
+# ------------------------------------------------------------
+# FILE: apps/sample_app/app/predict.py
+# ------------------------------------------------------------
+from fastapi import FastAPI
+from pydantic import BaseModel
+import numpy as np
+from .model import MODEL
+from .features import extract_features
+
+app = FastAPI(title="sample-app")
+
+class Inp(BaseModel):
+    values: list[float]
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+@app.post("/predict")
+def predict(inp: Inp):
+    X = extract_features(inp.values)
+    prob = float(MODEL.predict_proba(X)[0])
+    pred = int(prob > 0.5)
+    return {"prob": prob, "pred": pred}
+
+---
+
+# ------------------------------------------------------------
+# FILE: apps/sample_app/requirements.txt
+# ------------------------------------------------------------
+fastapi
+uvicorn[standard]
+scikit-learn
+numpy
+pydantic
+
+---
+
+# ------------------------------------------------------------
+# FILE: apps/sample_app/Dockerfile
+# ------------------------------------------------------------
+FROM python:3.11-slim
+WORKDIR /app
+COPY app/ /app/app/
+COPY requirements.txt /app/
+RUN pip install --no-cache-dir -r requirements.txt
+EXPOSE 8080
+CMD ["python", "-m", "uvicorn", "app.predict:app", "--host", "0.0.0.0", "--port", "8080"]
+
+---
+
+# ------------------------------------------------------------
+# FILE: charts/ml-app/Chart.yaml
+# ------------------------------------------------------------
+apiVersion: v2
+name: ml-app
+version: 0.1.0
+description: Generic ML inference app chart
+appVersion: "1.0.0"
+
+---
+
+# ------------------------------------------------------------
+# FILE: charts/ml-app/values.yaml
+# ------------------------------------------------------------
+replicaCount: 1
+image:
+  repository: your-dockerhub-username/sample-app
+  tag: latest
+  pullPolicy: IfNotPresent
+service:
+  type: ClusterIP
+  port: 80
+  targetPort: 8080
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+ingress:
+  enabled: false
+  className: ""
+  hosts:
+    - host: sample.local
+      paths:
+        - path: /
+          pathType: Prefix
+
+---
+
+# ------------------------------------------------------------
+# FILE: charts/ml-app/templates/deployment.yaml
+# ------------------------------------------------------------
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "ml-app.fullname" . }}
+  labels:
+    app.kubernetes.io/name: {{ include "ml-app.name" . }}
+    helm.sh/chart: {{ include "ml-app.chart" . }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "ml-app.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ include "ml-app.name" . }}
+        app.kubernetes.io/instance: {{ .Release.Name }}
+    spec:
+      containers:
+        - name: app
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - containerPort: {{ .Values.service.targetPort }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: {{ .Values.service.targetPort }}
+            initialDelaySeconds: 5
+            periodSeconds: 10
+
+---
+
+# ------------------------------------------------------------
+# FILE: charts/ml-app/templates/service.yaml
+# ------------------------------------------------------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "ml-app.fullname" . }}
+  labels:
+    app.kubernetes.io/name: {{ include "ml-app.name" . }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  type: {{ .Values.service.type }}
+  ports:
+    - port: {{ .Values.service.port }}
+      targetPort: {{ .Values.service.targetPort }}
+      protocol: TCP
+      name: http
+  selector:
+    app.kubernetes.io/name: {{ include "ml-app.name" . }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+
+---
+
+# ------------------------------------------------------------
+# FILE: charts/ml-app/templates/ingress.yaml
+# ------------------------------------------------------------
+{{- if .Values.ingress.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "ml-app.fullname" . }}
+  annotations: {}
+spec:
+  rules:
+    {{- range .Values.ingress.hosts }}
+    - host: {{ .host | quote }}
+      http:
+        paths:
+          {{- range .paths }}
+          - path: {{ .path }}
+            pathType: {{ .pathType }}
+            backend:
+              service:
+                name: {{ include "ml-app.fullname" $ }}
+                port:
+                  number: {{ $.Values.service.port }}
+          {{- end }}
+    {{- end }}
+{{- end }}
+
+---
+
+# ------------------------------------------------------------
+# FILE: charts/ml-app/templates/_helpers.tpl
+# ------------------------------------------------------------
+{{- define "ml-app.name" -}}
+{{- default .Chart.Name .Values.nameOverride | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+
+{{- define "ml-app.fullname" -}}
+{{- $name := default .Chart.Name .Values.nameOverride -}}
+{{- printf "%s-%s" .Release.Name $name | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+
+{{- define "ml-app.chart" -}}
+{{- printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" -}}
+{{- end -}}
+
+---
+
+# ------------------------------------------------------------
+# FILE: .github/workflows/ci.yml
+# ------------------------------------------------------------
+name: CI (lint & test)
+on:
+  pull_request:
+  push:
+    branches: [ main ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r apps/sample_app/requirements.txt pytest
+      - name: Smoke test
+        run: |
+          python - << 'PY'
+          import requests, subprocess, time
+          import multiprocessing as mp
+          def run():
+              import uvicorn
+              from apps.sample_app.app.predict import app
+              uvicorn.run(app, host='127.0.0.1', port=8080, log_level='error')
+          p = mp.Process(target=run); p.start(); time.sleep(2)
+          import json, urllib.request
+          print(urllib.request.urlopen('http://127.0.0.1:8080/health').read())
+          p.terminate(); p.join()
+          PY
+
+---
+
+# ------------------------------------------------------------
+# FILE: .github/workflows/build-deploy.yaml
+# ------------------------------------------------------------
+name: Build & Deploy (Docker + Helm)
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'apps/**'
+      - 'charts/**'
+      - '.github/workflows/build-deploy.yaml'
+  workflow_dispatch:
+
+jobs:
+  matrix-build-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Load app matrix
+        id: load
+        run: |
+          python - << 'PY'
+          import yaml, json
+          with open('apps/apps.yaml') as f:
+            data = yaml.safe_load(f)
+          matrix = {"include": []}
+          for app in data['apps']:
+            matrix["include"].append(app)
+          print('::set-output name=matrix::'+json.dumps(matrix))
+          PY
+
+      - name: Set matrix
+        id: matrix
+        run: echo "matrix=${{ steps.load.outputs.matrix }}" >> $GITHUB_OUTPUT
+
+    strategy:
+      matrix: ${{ fromJson(steps.load.outputs.matrix) }}
+
+    env:
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+      KUBE_CONFIG_B64: ${{ secrets.KUBE_CONFIG_B64 }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to DockerHub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ env.DOCKERHUB_USERNAME }}
+          password: ${{ env.DOCKERHUB_TOKEN }}
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.path }}
+          push: true
+          tags: ${{ matrix.image }}:latest
+
+      - name: Setup kubectl
+        run: |
+          echo "$KUBE_CONFIG_B64" | base64 -d > kubeconfig
+          echo "KUBECONFIG=$(pwd)/kubeconfig" >> $GITHUB_ENV
+
+      - name: Helm install/upgrade
+        uses: azure/setup-helm@v4
+      - name: Deploy via Helm
+        run: |
+          helm upgrade --install ${APP_NAME:=${{ matrix.name }}} charts/ml-app \
+            --set image.repository=${{ matrix.image }} \
+            --set image.tag=latest \
+            --set replicaCount=${{ matrix.replicas }} \
+            --set resources.requests.cpu=${{ matrix.cpu }} \
+            --set resources.requests.memory=${{ matrix.memory }} \
+            --set ingress.enabled=true \
+            --set ingress.hosts[0].host=${{ matrix.ingressHost }} \
+            --namespace=ml-apps --create-namespace
+
+---
+
+# ------------------------------------------------------------
+# FILE: .github/workflows/pages.yml
+# ------------------------------------------------------------
+name: Build Docs (MkDocs)
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'docs/**'
+      - 'mkdocs.yml'
+      - '.github/workflows/pages.yml'
+      - 'apps/**/README_app.md'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: |
+          pip install mkdocs mkdocs-material pyyaml
+          python scripts/collect_app_docs.py
+          mkdocs build --strict
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
+
+---
+
+# ------------------------------------------------------------
+# FILE: scripts/collect_app_docs.py
+# ------------------------------------------------------------
+import os, yaml, shutil
+
+os.makedirs('docs/apps', exist_ok=True)
+with open('apps/apps.yaml') as f:
+    data = yaml.safe_load(f)
+
+index_lines = ["# Deployed Apps", "", "一覧"]
+for app in data['apps']:
+    readme = os.path.join(app['path'], 'README_app.md')
+    target = os.path.join('docs', 'apps', f"{app['name']}.md")
+    if os.path.exists(readme):
+        shutil.copyfile(readme, target)
+    else:
+        with open(target, 'w', encoding='utf-8') as w:
+            w.write(f"# {app['name']}\n\nNo README_app.md found.\n")
+    index_lines.append(f"- [{app['name']}](apps/{app['name']}.md)")
+
+with open('docs/index.md', 'w', encoding='utf-8') as w:
+    w.write("\n".join(index_lines))
+
+print("docs collected.")
+
+---
+
+# ------------------------------------------------------------
+# FILE: scripts/generate_app.sh
+# ------------------------------------------------------------
+#!/usr/bin/env bash
+set -euo pipefail
+NAME=${1:-new-app}
+DST=apps/$NAME
+cp -r apps/sample_app "$DST"
+sed -i.bak "s/sample-app/$NAME/g" "$DST"/README_app.md || true
+rm -f "$DST"/README_app.md.bak || true
+echo "Created $DST"
+
+echo "apps.yaml に追記してください:\n  - name: $NAME\n    path: apps/$NAME\n    image: your-dockerhub-username/$NAME\n    replicas: 1\n    cpu: \"100m\"\n    memory: \"256Mi\"\n    ingressHost: $NAME.your-domain.local"
+
+---
+
+# ------------------------------------------------------------
+# FILE: scripts/bootstrap_cluster.sh
+# ------------------------------------------------------------
+#!/usr/bin/env bash
+set -euo pipefail
+kubectl create namespace ml-apps || true
+kubectl get ns ml-apps
+
+---
+
+# ------------------------------------------------------------
+# FILE: docs/index.md
+# ------------------------------------------------------------
+# Deployed Apps
+
+（このページは CI により自動生成・更新されます）
+
+---
+
+# ------------------------------------------------------------
+# FILE: mkdocs.yml
+# ------------------------------------------------------------
+site_name: k8s-ml-100apps-starter
+nav:
+  - Home: index.md
+  - Apps:
+      - apps/index: apps/index.md
+theme:
+  name: material
+markdown_extensions:
+  - tables
+  - toc
+
+---
+
+# ------------------------------------------------------------
+# FILE: apps/sample_app/README_app.md
+# ------------------------------------------------------------
+# sample-app
+
+## API
+- `GET /health` → `{ "status": "ok" }`
+- `POST /predict` → `{prob, pred}`
+
+```bash
+curl -X POST \
+  -H 'Content-Type: application/json' \
+  -d '{"values":[0.1,1.2,-0.3]}' \
+  http://sample.your-domain.local/predict
+```
+
+## 評価（テンプレ）
+- AUC / F1 / Precision / Recall を固定で算出
+- テストデータで `scripts/run_eval.py` を使ってスコア出力（将来拡張）
+
+---
+
+# ------------------------------------------------------------
+# FILE: scripts/run_eval.py
+# ------------------------------------------------------------
+import json, numpy as np
+from apps.sample_app.app.model import get_demo_model
+from apps.sample_app.app.evaluation import evaluate
+from apps.sample_app.app.features import extract_features
+
+# デモ用データ
+X = [ [0.1, 1.2, -0.3], [1.4, -0.2, 0.9], [-0.5, 0.3, 0.7] ]
+y = np.array([0,1,1])
+
+model = get_demo_model()
+probs = []
+for v in X:
+    prob = float(model.predict_proba(extract_features(v))[0])
+    probs.append(prob)
+
+print(json.dumps(evaluate(y, np.array(probs)), indent=2))
+
+---
+
+# ------------------------------------------------------------
+# FILE: Makefile
+# ------------------------------------------------------------
+PY=python
+APP=apps/sample_app
+.PHONY: dev test build deploy kind
+
+dev:
+	$(PY) -m uvicorn apps.sample_app.app.predict:app --host 0.0.0.0 --port 8080 --reload
+
+test:
+	$(PY) scripts/run_eval.py
+
+build:
+	docker build -t sample-app:local $(APP)
+
+deploy:
+	helm upgrade --install sample-app charts/ml-app \
+	  --set image.repository=sample-app \
+	  --set image.tag=local \
+	  --namespace=ml-apps --create-namespace
+
+kind:
+	kind create cluster || true
+	kubectl cluster-info
