@@ -1,0 +1,38 @@
+name: Auto Merge feature/main to main
+
+on:
+  push:
+    branches:
+      - feature/main  # ここをマージ対象のプッシュ先ブランチに合わせる
+
+jobs:
+  auto-merge:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write  # mainブランチにpush可能にするため
+
+    steps:
+      - name: Checkout target branch
+        uses: actions/checkout@v3
+        with:
+          ref: main  # マージ先のブランチを取得
+
+      - name: Set up GitHub CLI
+        uses: cli/cli-action@v2
+
+      - name: Configure git user
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Merge feature/main into main
+        run: |
+          set -e
+          git fetch origin feature/main
+          if git merge --no-ff origin/feature/main -m "Auto merge feature/main into main by GitHub Actions"; then
+            echo "Merge successful."
+            git push origin main
+          else
+            echo "⚠️ Merge conflict detected. Skipping push."
+            git merge --abort
+          fi
