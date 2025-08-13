@@ -37,10 +37,10 @@ jobs:
 
       - name: Organize directory by feature and extensions
         run: |
-          # feature名だけ切り出し（例：feature12/main → feature12）
+          # feature名だけ切り出し
           FEATURE_BRANCH_SHORT=$(echo "${GITHUB_REF#refs/heads/}" | cut -d'/' -f1)
 
-          # featureブランチの全ファイルリストを取得
+          # featureブランチの全ファイルリストを取得（.githubは除外）
           FILES=$(git ls-tree -r --name-only origin/"$FEATURE_BRANCH_SHORT" | grep -v '^.github/')
 
           # 拡張子ごとのファイル数カウント
@@ -62,18 +62,20 @@ jobs:
             fi
           done
 
-          # target_dir名作成（例：feature12_py）
           target_dir="${FEATURE_BRANCH_SHORT}_${max_ext}"
           mkdir -p "$target_dir"
 
           echo "Created directory: $target_dir"
 
-          # 現在のmainの直下から、.git と .github を除外して target_dir に全部移動
-          shopt -s dotglob nullglob
-          for f in *; do
-            if [[ "$f" != ".git" && "$f" != ".github" && "$f" != "$target_dir" ]]; then
-              mv "$f" "$target_dir"/
-            fi
+          # サブディレクトリ構造を保ったまま target_dir にコピー
+          # --parents で相対パス構造ごとコピー
+          for f in $FILES; do
+            cp --parents "$f" "$target_dir"/
+          done
+
+          # コピー元を削除する場合（main直下構成を消してtarget_dirだけにする）
+          for f in $FILES; do
+            rm -rf "$f"
           done
 
       - name: Commit and push changes
@@ -84,4 +86,3 @@ jobs:
             git push origin main
           else
             echo "No changes to commit."
-          fi
