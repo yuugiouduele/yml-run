@@ -1,38 +1,76 @@
-name: Auto Merge feature/main to main
+name: Auto Merge feature branches to main and Organize Directory
 
 on:
   push:
     branches:
-      - feature[0-9]*/main  # ここをマージ対象のプッシュ先ブランチに合わせる
+      - 'feature[0-9]*/main'  # feature+数字の任意ブランチのmainサブブランチにpushされた時
 
 jobs:
-  auto-merge:
+  auto-merge-and-organize:
     runs-on: ubuntu-latest
     permissions:
-      contents: write  # mainブランチにpush可能にするため
+      contents: write  # mainにpush可能にするため
 
     steps:
-      - name: Checkout target branch
+      - name: Checkout main branch
         uses: actions/checkout@v3
         with:
-          ref: main  # マージ先のブランチを取得
-
-      - name: Set up GitHub CLI
-        uses: cli/cli-action@v2
+          ref: main
 
       - name: Configure git user
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-      - name: Merge feature/main into main
+      - name: Merge feature branch into main
         run: |
           set -e
-          git fetch origin feature/main
-          if git merge --no-ff origin/feature/main -m "Auto merge feature/main into main by GitHub Actions"; then
+          FEATURE_BRANCH="${GITHUB_REF#refs/heads/}"
+          git fetch origin "$FEATURE_BRANCH"
+          if git merge --no-ff origin/"$FEATURE_BRANCH" -m "Auto merge $FEATURE_BRANCH into main by GitHub Actions"; then
             echo "Merge successful."
+          else
+            echo "⚠️ Merge conflict detected. Aborting merge."
+            git merge --abort
+            exit 0
+          fi
+
+      - name: Organize directory by feature and extensions
+        run: |
+          FEATURE_BRANCH_SHORT=$(echo "${GITHUB_REF#refs/heads/}" | cut -d'/' -f1)
+          FILES=$(git ls-tree -r --name-only origin/"$FEATURE_BRANCH_SHORT")
+
+          declare -A ext_counts
+          for file in $FILES; do
+            if [[ "$file" == *.* ]]; then
+              ext="${file##*.}"
+              ((ext_counts[$ext]++))
+            fi
+          done
+
+          max_ext=""
+          max_count=0
+          for ext in "${!ext_counts[@]}"; do
+            if (( ext_counts[$ext] > max_count )); then
+              max_ext=$ext
+              max_count=${ext_counts[$ext]}
+            fi
+          done
+
+          target_dir="${FEATURE_BRANCH_SHORT}_${max_ext}"
+          mkdir -p "$target_dir"
+
+          echo "Created directory: $target_dir"
+          
+          # ファイルの移動等の処理があればここに追加
+
+      - name: Commit and push changes
+        run: |
+          git add .
+          if ! git diff --cached --quiet; then
+            git commit -m "Organize directory structure by feature and extension after merge"
             git push origin main
           else
-            echo "⚠️ Merge conflict detected. Skipping push."
-            git merge --abort
+            echo "No changes to commit."
           fi
+
