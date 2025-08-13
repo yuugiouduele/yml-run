@@ -3,7 +3,7 @@ name: Auto Merge feature/main to main
 on:
   push:
     branches:
-      - feature/main  # ここをマージ対象のプッシュ先ブランチに合わせる
+      - feature[0-9]*/main  # ここをマージ対象のプッシュ先ブランチに合わせる
 
 jobs:
   auto-merge:
