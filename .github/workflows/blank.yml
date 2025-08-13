@@ -1,11 +1,52 @@
-name: Example Workflow
-
-on: [push]
+name: Directory Organize on Push
+on:
+  push:
 
 jobs:
-  build:
+  organize:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v2   # リポジトリをチェックアウト
-      - name: Run a script
-        run: echo "Hello, GitHub Actions!"
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Get list of tracked files except .github/workflows
+        id: files
+        run: |
+          # ワークフロー以外のファイル群を取得
+          files=$(git diff-tree --no-commit-id --name-only -r ${{ github.sha }} | grep -v '^.github/workflows')
+          echo "files<<EOF" >> $GITHUB_OUTPUT
+          echo "$files" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Create directories for each file's top-level folder
+        run: |
+          # ファイルリストを配列に読み込み
+          IFS=$'\n' read -rd '' -a file_array <<< "${{ steps.files.outputs.files }}"
+          
+          # 各ファイルについてトップレベルのディレクトリをmkdir（ファイルならスキップ）
+          for file in "${file_array[@]}"; do
+            topdir=$(echo "$file" | cut -d '/' -f1)
+            if [ -n "$topdir" ] && [ ! -d "sorted/$topdir" ] && [ "$topdir" != "sorted" ]; then
+              mkdir -p "sorted/$topdir"
+            fi
+          done
+
+      - name: Move files except .github/workflows into sorted
+        run: |
+          shopt -s extglob
+          # .github/workflowsは除外して移動
+          for f in $(git diff-tree --no-commit-id --name-only -r ${{ github.sha }} | grep -v '^.github/workflows'); do
+            # フォルダならそのままmove、ファイルなら親ディレクトリに格納
+            parent_dir=$(dirname "$f")
+            if [ "$parent_dir" = "." ]; then
+              mv "$f" sorted/
+            else
+              mv "$f" "sorted/$parent_dir"
+            fi
+          done
+
+      - name: List files in sorted directory
+        run: ls -l sorted
+
+      - name: List files in root directory (to verify .github is untouched)
+        run: ls -l
