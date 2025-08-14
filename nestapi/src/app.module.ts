@@ -10,7 +10,7 @@ import { ImageController } from './image.controller';
   providers: [AppService],
 })
 // app.module.tsなどにThrottlerModuleを登録
-
+ 
 @Module({
   imports: [
     ThrottlerModule.forRoot({
